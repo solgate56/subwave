@@ -1,21 +1,16 @@
-// Atomic file replacement — write to a temp file beside the target, then
-// rename(2) over it, so no reader ever observes a half-written file.
+// Atomic file replacement: write a temp beside the target, then rename(2) over
+// it, so Liquidsoap's polls and the durable JSON writers never see a truncated
+// file. The temp carries a random suffix (two un-serialised writers must not
+// rename each other's temp into place) and sits next to the target so the
+// rename never crosses a filesystem.
 //
-// Two reader populations make this matter:
-//   - Liquidsoap consumes several state files the controller writes (auto.m3u
-//     via reload_mode="watch", the next/say/intro/sfx handoffs via a
-//     read-delete poll) — a poll or inotify event landing mid-write would see
-//     a truncated file.
-//   - Durable JSON (settings.json, session.json, queue.json, …) survives a
-//     crash or power loss mid-write only if the old contents stay intact
-//     until the new ones are fully on disk.
-//
-// The temp name carries a random suffix so two un-serialised writers to the
-// same path can't rename each other's half-written temp into place. The temp
-// lives next to the target, so the rename never crosses a filesystem boundary.
+// A failed write removes its temp — nothing else can ever find that name, and
+// for the scheduled backup it would be a partial multi-hundred-MB zip. The
+// ORIGINAL error still propagates; cleanup must not mask it.
 
 import { randomBytes } from 'node:crypto';
-import { rename, writeFile } from 'node:fs/promises';
+import { renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { rename, unlink, writeFile } from 'node:fs/promises';
 
 export async function writeFileAtomic(
   path: string,
@@ -23,6 +18,43 @@ export async function writeFileAtomic(
   { mode }: { mode?: number } = {},
 ): Promise<void> {
   const tmp = `${path}.${randomBytes(4).toString('hex')}.tmp`;
-  await writeFile(tmp, contents, mode != null ? { mode } : {});
-  await rename(tmp, path);
+  try {
+    await writeFile(tmp, contents, mode != null ? { mode } : {});
+    await rename(tmp, path);
+  } catch (err) {
+    // Nothing to remove if writeFile failed before creating the file.
+    await unlink(tmp).catch(() => {});
+    throw err;
+  }
+}
+
+// One instance per owning store, shared by ordinary saves and durable recovery
+// writes. Atomic rename prevents partial files, but only ordering prevents an
+// older snapshot from replacing a newer one after recovery is acknowledged.
+export function createSerialFileWriter(path: string) {
+  let pending: Promise<void> = Promise.resolve();
+  return (contents: string | Buffer): Promise<void> => {
+    const next = pending.then(() => writeFileAtomic(path, contents));
+    // Keep this caller's rejection while allowing subsequent saves to retry.
+    pending = next.catch(() => {});
+    return next;
+  };
+}
+
+// Synchronous twin for small state whose publication is itself a synchronous
+// commit boundary. It keeps the same adjacent-temp + rename contract, so a
+// reader can never observe a partial replacement.
+export function writeFileAtomicSync(
+  path: string,
+  contents: string | Buffer,
+  { mode }: { mode?: number } = {},
+): void {
+  const tmp = `${path}.${randomBytes(4).toString('hex')}.tmp`;
+  try {
+    writeFileSync(tmp, contents, mode != null ? { mode } : {});
+    renameSync(tmp, path);
+  } catch (err) {
+    try { unlinkSync(tmp); } catch {}
+    throw err;
+  }
 }
