@@ -59,7 +59,7 @@ export interface NeverPlayAgainDeps {
    *  the entry vanished between the earlier add()/match() and this call. */
   blocklistSetLibraryPath: (type: 'track', id: string, libraryPath: string) => Promise<BlockEntryLike | null>;
   /** queue.purgeBlocked() — drops now-blocked upcoming items, returns how many. */
-  purgeBlocked: () => number;
+  purgeBlockedIncludingSent: () => Promise<{ removed: number; kept: number }>;
   /** scheduler.refreshAutoPlaylist() — rewrites auto.m3u. */
   refreshAutoPlaylist: () => Promise<void>;
   /** never-play-ignore.isEnabled() — is NEVER_PLAY_LIBRARY_PATH configured. */
@@ -83,6 +83,8 @@ export interface NeverPlayAgainResult {
   ok: true;
   blocked: BlockEntryLike;
   purged: number;
+  /** Blocked queued copies that had already left Liquidsoap's removable queue. */
+  queuedDuplicatesKept: number;
   navidromeExcluded: boolean;
   navidromeScanTriggered: boolean;
   skip: { pending: boolean; committed: boolean };
@@ -139,6 +141,13 @@ export async function runNeverPlayAgain(deps: NeverPlayAgainDeps, expectedSubson
     deps.log('error', `never-play-again: getSong(${subsonicId}) failed: ${err?.message ?? err}`);
   }
 
+  // Metadata lookup can take long enough for the station to move on. Recheck
+  // before any destructive mutation so a confirmation for A never blocks B.
+  const afterMetadata = await deps.getNowPlaying();
+  if (afterMetadata?.subsonic_id !== expectedSubsonicId) {
+    throw new NeverPlayAgainError(409, 'the on-air track changed before this could be applied ? try again');
+  }
+
   const name = song?.title ?? now?.title ?? null;
   const artist = song?.artist ?? now?.artist ?? null;
   const album = song?.album ?? now?.album ?? null;
@@ -186,7 +195,13 @@ export async function runNeverPlayAgain(deps: NeverPlayAgainDeps, expectedSubson
     ? `${name ?? subsonicId} — ${artist ?? 'unknown artist'} added to the never-play blocklist (never-play-again)`
     : `${name ?? subsonicId} — already on the never-play blocklist (never-play-again)`);
 
-  const purged = deps.purgeBlocked();
+  const recall = await deps.purgeBlockedIncludingSent();
+  const purged = recall.removed;
+  const queuedDuplicatesKept = recall.kept;
+  if (queuedDuplicatesKept > 0) {
+    const msg = `${queuedDuplicatesKept} blocked queued cop${queuedDuplicatesKept === 1 ? 'y could' : 'ies could'} not be recalled from Liquidsoap`;
+    warning = warning ? `${warning}; ${msg}` : msg;
+  }
 
   let navidromeExcluded = false;
   let navidromeScanTriggered = false;
@@ -220,17 +235,9 @@ export async function runNeverPlayAgain(deps: NeverPlayAgainDeps, expectedSubson
     }
   }
 
-  if (navidromeExcluded) {
-    // Awaited (not fire-and-forget): the round trip that ASKS Navidrome to
-    // scan is normally fast. "Not awaited to completion" means the scan
-    // itself — this call returns as soon as Navidrome acknowledges the
-    // request, well before a library-size-dependent scan finishes.
-    const scan = await deps.startScan();
-    navidromeScanTriggered = scan.ok;
-    if (!scan.ok) {
-      warning = "Navidrome scan trigger failed — the exclusion will apply on Navidrome's next scheduled scan instead";
-    }
-  }
+  // The Navidrome scan is deliberately deferred until AFTER the live skip.
+  // It is catalogue housekeeping and must not widen the race window between
+  // the operator's confirmation and the immediate on-air action.
 
   // Everything above has already committed and is NOT rolled back if the
   // skip fails below — a working SUB/WAVE-side block (and, when it landed,
@@ -257,7 +264,23 @@ export async function runNeverPlayAgain(deps: NeverPlayAgainDeps, expectedSubson
   // alongside them.
   try {
     const prep = await deps.commitBeforeSkip();
+    // commitBeforeSkip may itself wait while the station advances. This is the
+    // last possible identity check and sits immediately beside the telnet skip.
+    const beforeSkip = await deps.getNowPlaying();
+    if (beforeSkip?.subsonic_id !== expectedSubsonicId) {
+      throw new NeverPlayAgainError(409, 'the on-air track changed before this could be applied ? try again');
+    }
     await deps.skipTrack();
+
+    if (navidromeExcluded) {
+      const scan = await deps.startScan();
+      navidromeScanTriggered = scan.ok;
+      if (!scan.ok) {
+        const msg = "Navidrome scan trigger failed ? the exclusion will apply on Navidrome's next scheduled scan instead";
+        warning = warning ? `${warning}; ${msg}` : msg;
+      }
+    }
+
     deps.log('scheduler', prep.pending && !prep.committed
       ? `track skipped by operator (never-play-again) — queued pick not confirmed in dj_queue after ${Math.round(prep.waitedMs / 1000)}s; the auto playlist may fill the slot first`
       : 'track skipped by operator (never-play-again)');
@@ -266,6 +289,7 @@ export async function runNeverPlayAgain(deps: NeverPlayAgainDeps, expectedSubson
       ok: true,
       blocked,
       purged,
+      queuedDuplicatesKept,
       navidromeExcluded,
       navidromeScanTriggered,
       skip: { pending: prep.pending, committed: prep.committed },

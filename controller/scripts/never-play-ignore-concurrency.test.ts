@@ -61,7 +61,7 @@ try {
   const finalList = npi.list();
   assert.deepEqual(
     [...finalList].sort(),
-    ['New/One.flac', 'New/Two.flac', 'Pre/Existing.flac'].sort(),
+    ['/New/One.flac', '/New/Two.flac', 'Pre/Existing.flac'].sort(),
     'the pre-existing on-disk entry AND both concurrently-added entries all survive — ' +
     'a premature "loaded" short-circuit would have dropped Pre/Existing.flac, ' +
     'and a lost update between the two concurrent adds would have dropped one of the New/* entries',
@@ -70,7 +70,7 @@ try {
   const onDisk = readFileSync(ndignorePath, 'utf8').split('\n').filter(Boolean);
   assert.deepEqual(
     [...onDisk].sort(),
-    ['New/One.flac', 'New/Two.flac', 'Pre/Existing.flac'].sort(),
+    ['/New/One.flac', '/New/Two.flac', 'Pre/Existing.flac'].sort(),
     'the persisted file matches memory — no entry was silently overwritten by the losing side of the race',
   );
 

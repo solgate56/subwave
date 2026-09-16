@@ -129,10 +129,16 @@ function escapeGitignoreSegment(segment: string): string {
  * SAME original path (music/blocklist.ts's BlockEntry.libraryPath), and so
  * the escaping rules are directly unit-testable against real library names.
  */
-export function toIgnorePattern(rel: string): string {
+function toLegacyIgnorePattern(rel: string): string {
   const glob = rel.split('/').map(escapeGitignoreSegment).join('/');
   const leading = glob.startsWith('#') || glob.startsWith('!') ? `\\${glob}` : glob;
   return leading.replace(/ +$/, (trailing) => trailing.replace(/ /g, '\\ '));
+}
+
+export function toIgnorePattern(rel: string): string {
+  // Root-anchor every generated rule. Without the leading slash a root-level
+  // filename such as Track.flac also matches Artist/Track.flac.
+  return `/${toLegacyIgnorePattern(rel)}`;
 }
 
 // `ignoredPaths` holds PATTERN-form strings (the output of toIgnorePattern) —
@@ -232,6 +238,7 @@ function withLock<T>(fn: () => Promise<T>): Promise<T> {
 export function resolveWithinRoot(rel: unknown): string {
   if (!ROOT) throw new Error('NEVER_PLAY_LIBRARY_PATH is not configured');
   if (typeof rel !== 'string') throw new Error('song.path missing or malformed');
+  if (/[\u0000-\u001F\u007F]/.test(rel)) throw new Error('song.path contains unsupported control characters');
   const trimmed = rel.trim();
   if (!trimmed || trimmed.length > 1024) throw new Error('song.path missing or malformed');
   // Reject an absolute path outright (POSIX or a Windows drive letter) —
@@ -269,11 +276,14 @@ export function resolveWithinRoot(rel: unknown): string {
 export async function add(rel: string): Promise<boolean> {
   const safe = resolveWithinRoot(rel);
   const pattern = toIgnorePattern(safe);
+  const legacyPattern = toLegacyIgnorePattern(safe);
   await load();
   return withLock(async () => {
     const current = await readList();
     ignoredPaths = current;
-    if (current.includes(pattern)) return false;
+    // Treat the pre-anchor form as pre-existing too: do not claim a manual or
+    // older rule merely because this version now emits a safer anchored form.
+    if (current.includes(pattern) || current.includes(legacyPattern)) return false;
     const next = [...current, pattern];
     await persistList(next);
     ignoredPaths = next; // only published once the write actually succeeded
@@ -300,9 +310,10 @@ export async function remove(rel: string): Promise<boolean> {
   // blocklist.json entry — or one new call site — and the asymmetry becomes a
   // remove() that reports "not present" and leaves the line on disk forever.
   // A rejection here is a miss, not an error, per this function's contract.
-  let pattern: string;
+  let patterns: Set<string>;
   try {
-    pattern = toIgnorePattern(resolveWithinRoot(rel));
+    const safe = resolveWithinRoot(rel);
+    patterns = new Set([toIgnorePattern(safe), toLegacyIgnorePattern(safe)]);
   } catch {
     return false;
   }
@@ -310,8 +321,10 @@ export async function remove(rel: string): Promise<boolean> {
   return withLock(async () => {
     const current = await readList();
     ignoredPaths = current;
-    if (!current.includes(pattern)) return false;
-    const next = current.filter((p) => p !== pattern);
+    if (!current.some((p) => patterns.has(p))) return false;
+    // Remove both the current anchored spelling and the legacy unanchored one
+    // if either/both survived from an older release.
+    const next = current.filter((p) => !patterns.has(p));
     await persistList(next);
     ignoredPaths = next;
     return true;

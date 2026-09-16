@@ -306,7 +306,7 @@ export default function StationHeader({
             tone="danger"
             disabled={!!busy || !np?.title}
             onClick={onNeverPlayAgain}
-            title="Block this track everywhere (SUB/WAVE + Navidrome) and skip it now"
+            title="Block this track in SUB/WAVE, also exclude it from Navidrome when configured, and skip it now"
             className="border-2 border-[#2e7d32] bg-[#2e7d32] hover:border-[#1b5e20] hover:bg-[#1b5e20] focus-visible:border-[#1b5e20] focus-visible:bg-[#1b5e20] active:border-[#1b5e20] active:bg-[#1b5e20]"
           >
             <Ban aria-hidden />

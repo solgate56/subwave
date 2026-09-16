@@ -63,7 +63,7 @@ function makeDeps(calls: string[], overrides: Partial<NeverPlayAgainDeps> = {}):
       assert.equal(id, 'trk1');
       return makeEntry({ libraryPath });
     },
-    purgeBlocked: () => { calls.push('purgeBlocked'); return 0; },
+    purgeBlockedIncludingSent: async () => { calls.push('purgeBlocked'); return { removed: 0, kept: 0 }; },
     refreshAutoPlaylist: async () => { calls.push('refreshAutoPlaylist'); },
     ignoreEnabled: () => { calls.push('ignoreEnabled'); return true; },
     resolveWithinRoot: (rel) => { calls.push('resolveWithinRoot'); return rel; },
@@ -137,6 +137,61 @@ test('expectedSubsonicId MISMATCH: 409, and absolutely no blocklist/.ndignore/sk
   assert.deepEqual(calls, ['getNowPlaying']);
 });
 
+
+test('track changes during getSong: recheck refuses before block/ignore/skip mutation', async () => {
+  const calls: string[] = [];
+  let snapshots = 0;
+  const deps = makeDeps(calls, {
+    getNowPlaying: async () => {
+      calls.push('getNowPlaying');
+      snapshots++;
+      return snapshots === 1 ? NOW_PLAYING : { ...NOW_PLAYING, subsonic_id: 'trk2' };
+    },
+  });
+  await assert.rejects(() => runNeverPlayAgain(deps, EXPECTED_ID), (err: unknown) => {
+    assert.ok(err instanceof NeverPlayAgainError);
+    assert.equal(err.status, 409);
+    return true;
+  });
+  assert.ok(calls.includes('getSong'));
+  assert.ok(!calls.includes('blocklistAdd'));
+  assert.ok(!calls.includes('ignoreAdd'));
+  assert.ok(!calls.includes('skipTrack'));
+});
+
+test('track changes during commit wait: block remains, but replacement track is never skipped', async () => {
+  const calls: string[] = [];
+  let snapshots = 0;
+  const deps = makeDeps(calls, {
+    getNowPlaying: async () => {
+      calls.push('getNowPlaying');
+      snapshots++;
+      return snapshots < 3 ? NOW_PLAYING : { ...NOW_PLAYING, subsonic_id: 'trk2' };
+    },
+  });
+  await assert.rejects(() => runNeverPlayAgain(deps, EXPECTED_ID), (err: unknown) => {
+    assert.ok(err instanceof NeverPlayAgainError);
+    assert.equal(err.status, 409);
+    return true;
+  });
+  assert.ok(calls.includes('blocklistAdd'), 'confirmed track remains permanently blocked even if it finishes naturally');
+  assert.ok(calls.includes('commitBeforeSkip'));
+  assert.ok(!calls.includes('skipTrack'), 'replacement track must never be skipped');
+  assert.ok(!calls.includes('startScan'), 'optional catalogue scan never delays or follows a refused skip');
+});
+
+test('unrecallable queued duplicate is reported while the current track is still blocked and skipped', async () => {
+  const calls: string[] = [];
+  const deps = makeDeps(calls, {
+    purgeBlockedIncludingSent: async () => { calls.push('purgeBlocked'); return { removed: 2, kept: 1 }; },
+  });
+  const result = await runNeverPlayAgain(deps, EXPECTED_ID);
+  assert.equal(result.purged, 2);
+  assert.equal(result.queuedDuplicatesKept, 1);
+  assert.match(result.warning ?? '', /could not be recalled from Liquidsoap/i);
+  assert.ok(calls.includes('skipTrack'));
+});
+
 test('expectedSubsonicId mismatch message is distinct from the no-current-track message', async () => {
   const calls: string[] = [];
   const deps = makeDeps(calls);
@@ -175,15 +230,17 @@ test('successful ordering: block (no libraryPath yet), purge, ignore, upgrade li
   assert.deepEqual(calls, [
     'getNowPlaying',
     'getSong',
+    'getNowPlaying',
     'ignoreEnabled',
     'resolveWithinRoot',
     'blocklistAdd',
     'purgeBlocked',
     'ignoreAdd',
     'blocklistSetLibraryPath',
-    'startScan',
     'commitBeforeSkip',
+    'getNowPlaying',
     'skipTrack',
+    'startScan',
     'refreshAutoPlaylist',
   ]);
 });
@@ -333,7 +390,7 @@ test('already-blocked WITHOUT libraryPath, a path resolves this time: upgrades t
   // that this upgrade can never happen ahead of a confirmed write.
   assert.deepEqual(
     calls.slice(calls.indexOf('blocklistAdd'), calls.indexOf('startScan')),
-    ['blocklistAdd', 'blocklistMatch', 'purgeBlocked', 'ignoreAdd', 'blocklistSetLibraryPath'],
+    ['blocklistAdd', 'blocklistMatch', 'purgeBlocked', 'ignoreAdd', 'blocklistSetLibraryPath', 'commitBeforeSkip', 'getNowPlaying', 'skipTrack'],
   );
 });
 
@@ -508,7 +565,7 @@ test('skip failure propagates unhandled — everything before it already committ
   // as the existing POST /dj/skip route's own failure shape.
   assert.ok(calls.includes('blocklistAdd'));
   assert.ok(calls.includes('ignoreAdd'));
-  assert.ok(calls.includes('startScan'));
+  assert.ok(!calls.includes('startScan'), 'catalogue scan is deferred until after a successful skip attempt');
   assert.ok(calls.includes('commitBeforeSkip'));
   assert.ok(calls.includes('skipTrack'));
   // Still launches via `finally` even though skipTrack threw — see the
